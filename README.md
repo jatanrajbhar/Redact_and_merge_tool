@@ -25,7 +25,7 @@ A powerful, browser-based tool for redacting sensitive information from PDF docu
 
 ## Usage
 
-1. **Open the Tool**: Open `file.html` in any modern web browser
+1. **Open the Tool**: Open `index.html` in any modern web browser
 2. **Upload PDFs**: Drag and drop PDF files or click to browse
 3. **Automatic Scanning**: The tool extracts text and applies redaction rules
 4. **Review Matches**: Check detected items in the Scan Results panel
