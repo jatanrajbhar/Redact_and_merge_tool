@@ -14,6 +14,9 @@
     <!-- pdf-lib for PDF manipulation -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 
+    <!-- JSZip for bundling split PDF files into a single download -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
     <script>
         tailwind.config = {
             theme: {
@@ -68,11 +71,19 @@
             areas: [],
             isProcessing: false,
             isScanning: false,
+            activeTab: 'redact', // 'redact' | 'split'
+            split: {
+                fileId: null,
+                mode: 'every', // 'every' | 'ranges'
+                ranges: '',
+            },
             options: {
+                applyRedaction: true,
                 removeMetadata: true,
-                compress: false,
+                compressionLevel: 0, // 0=Off 1=Low 2=Medium 3=High 4=Maximum
                 mergeAll: true,
-            }
+            },
+            compressionEstimates: {}, // fileId -> { originalSize, compressedSize } | null
         };
 
         // --- ICONS ---
@@ -85,6 +96,9 @@
             upload: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>`,
             check: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>`,
             x: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>`,
+            chevronUp: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>`,
+            chevronDown: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`,
+            merge: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3"/><polyline points="16 2 12 6 8 2"/><line x1="12" y1="6" x2="12" y2="15"/></svg>`,
         };
 
         // --- UTILS ---
@@ -415,6 +429,7 @@
             scanForRedactions();
             state.isScanning = false;
             render();
+            analyzeCompression();
         }
 
         // --- ACTUAL PDF REDACTION & MERGING using pdf-lib ---
@@ -453,40 +468,31 @@
                     globalPageIndex += f.pageCount;
                 });
 
-                state.areas.forEach(area => {
-                    let targetPageIndex;
+                if (state.options.applyRedaction) {
+                    state.areas.forEach(area => {
+                        let targetPageIndex;
 
-                    if (state.options.mergeAll && state.files.length > 1) {
-                        // Find the global page index in the merged document
-                        const fileMapping = filePageMap.find(m => m.fileId === area.fileId);
-                        if (!fileMapping) return;
-                        targetPageIndex = fileMapping.startPage + area.pageIndex;
-                    } else {
-                        // Single file mode - only redact areas from the first file
-                        if (area.fileId !== state.files[0].id) return;
-                        targetPageIndex = area.pageIndex;
-                    }
+                        if (state.options.mergeAll && state.files.length > 1) {
+                            const fileMapping = filePageMap.find(m => m.fileId === area.fileId);
+                            if (!fileMapping) return;
+                            targetPageIndex = fileMapping.startPage + area.pageIndex;
+                        } else {
+                            if (area.fileId !== state.files[0].id) return;
+                            targetPageIndex = area.pageIndex;
+                        }
 
-                    if (targetPageIndex >= 0 && targetPageIndex < pages.length) {
-                        const page = pages[targetPageIndex];
-                        const { width: pageWidth, height: pageHeight } = page.getSize();
-
-                        // Use absolute coordinates stored from text extraction
-                        const rectX = area.absX;
-                        const rectY = area.absY;
-                        const rectW = area.absWidth;
-                        const rectH = area.absHeight;
-
-                        // Draw black rectangle to cover the text
-                        page.drawRectangle({
-                            x: rectX,
-                            y: rectY,
-                            width: rectW,
-                            height: rectH,
-                            color: rgb(0, 0, 0),
-                        });
-                    }
-                });
+                        if (targetPageIndex >= 0 && targetPageIndex < pages.length) {
+                            const page = pages[targetPageIndex];
+                            page.drawRectangle({
+                                x: area.absX,
+                                y: area.absY,
+                                width: area.absWidth,
+                                height: area.absHeight,
+                                color: rgb(0, 0, 0),
+                            });
+                        }
+                    });
+                }
 
                 // Remove metadata if option is enabled
                 if (state.options.removeMetadata) {
@@ -499,7 +505,18 @@
                 }
 
                 // Save the PDF
-                const pdfBytes = await outputPdf.save();
+                let pdfBytes;
+                if (state.options.applyRedaction && state.areas.length > 0) {
+                    // True redaction: MUST canvas re-render to destroy underlying text data.
+                    // Drawing black boxes alone leaves text selectable — canvas converts
+                    // everything to pixels, permanently removing all text content.
+                    const lvl = state.options.compressionLevel;
+                    const dpi     = lvl >= 4 ? 72  : lvl >= 3 ? 120 : lvl >= 2 ? 130 : 150;
+                    const quality = lvl >= 4 ? 0.32 : lvl >= 3 ? 0.65 : lvl >= 2 ? 0.78 : 0.88;
+                    pdfBytes = await canvasRebuildPDF(outputPdf, dpi, quality);
+                } else {
+                    pdfBytes = await applyCompression(outputPdf, state.options.compressionLevel);
+                }
                 const blob = new Blob([pdfBytes], { type: 'application/pdf' });
                 const url = URL.createObjectURL(blob);
                 const link = document.createElement('a');
@@ -540,6 +557,47 @@
         function removeFile(id) {
             state.files = state.files.filter(f => f.id !== id);
             scanForRedactions();
+            render();
+        }
+
+        function moveFile(id, direction) {
+            const idx = state.files.findIndex(f => f.id === id);
+            if (idx === -1) return;
+            const newIdx = idx + direction;
+            if (newIdx < 0 || newIdx >= state.files.length) return;
+            const arr = [...state.files];
+            [arr[idx], arr[newIdx]] = [arr[newIdx], arr[idx]];
+            state.files = arr;
+            render();
+        }
+
+        async function handleMergeDownload() {
+            if (state.files.length === 0) return;
+            state.isProcessing = true;
+            render();
+            try {
+                const { PDFDocument } = PDFLib;
+                const mergedPdf = await PDFDocument.create();
+                for (const fileData of state.files) {
+                    const srcPdf = await PDFDocument.load(fileData.arrayBuffer.slice(0));
+                    const copied = await mergedPdf.copyPages(srcPdf, srcPdf.getPageIndices());
+                    copied.forEach(p => mergedPdf.addPage(p));
+                }
+                const pdfBytes = await mergedPdf.save({ useObjectStreams: true });
+                const blob = new Blob([pdfBytes], { type: 'application/pdf' });
+                const url  = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `merged_${state.files.length}_files.pdf`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+            } catch(err) {
+                console.error('Merge error:', err);
+                alert(`Error merging: ${err.message}`);
+            }
+            state.isProcessing = false;
             render();
         }
 
@@ -586,7 +644,507 @@
             render();
         }
 
+        // --- SPLIT ---
+        function setTab(tab) {
+            state.activeTab = tab;
+            render();
+        }
+
+        function setSplitFile(id) {
+            state.split.fileId = id;
+            render();
+        }
+
+        function setSplitMode(mode) {
+            state.split.mode = mode;
+            render();
+        }
+
+        function setSplitRanges(value) {
+            state.split.ranges = value;
+            const inputEl = document.getElementById('split-ranges-input');
+            const selStart = inputEl ? inputEl.selectionStart : null;
+            const selEnd = inputEl ? inputEl.selectionEnd : null;
+            render();
+            const restored = document.getElementById('split-ranges-input');
+            if (restored && selStart !== null) {
+                restored.focus();
+                restored.setSelectionRange(selStart, selEnd);
+            }
+        }
+
+        function setCompressionLevel(level) {
+            state.options.compressionLevel = level;
+            render();
+        }
+
+        async function applyCompression(pdfDoc, level) {
+            if (level === 0) return pdfDoc.save();
+
+            // Level 2+: flatten form fields
+            if (level >= 2) {
+                try {
+                    const form = pdfDoc.getForm();
+                    if (form.getFields().length > 0) form.flatten();
+                } catch(e) {}
+            }
+
+            // Level 3+: canvas re-render (major compression via JPEG re-encoding)
+            if (level >= 3) {
+                // Level 3 = 120 DPI / 65% quality, Level 4 = 72 DPI / 32% quality (extreme)
+                const dpi     = level >= 4 ? 72  : 120;
+                const quality = level >= 4 ? 0.32 : 0.65;
+                return canvasRebuildPDF(pdfDoc, dpi, quality);
+            }
+
+            return pdfDoc.save({ useObjectStreams: true });
+        }
+
+        // Convert base64 string to Uint8Array safely (handles large strings)
+        function base64ToBytes(base64) {
+            const binary = atob(base64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes;
+        }
+
+        // dpi: render resolution. quality: JPEG 0–1.
+        async function canvasRebuildPDF(pdfDoc, dpi, quality) {
+            const { PDFDocument } = PDFLib;
+            const POINTS_PER_INCH = 72;
+
+            const pageSizes = pdfDoc.getPages().map(p => p.getSize());
+
+            // Save to bytes first so PDF.js can load it
+            const tempBytes = await pdfDoc.save({ useObjectStreams: true });
+
+            let pdfJsDoc;
+            try {
+                pdfJsDoc = await pdfjsLib.getDocument({ data: tempBytes.slice(0) }).promise;
+            } catch(e) {
+                console.warn('PDF.js failed to load document, returning pdf-lib output:', e);
+                return tempBytes;
+            }
+
+            const numPages = pdfJsDoc.numPages;
+            const newPdf   = await PDFDocument.create();
+            const canvas   = document.createElement('canvas');
+            const ctx      = canvas.getContext('2d');
+            let   rendered = 0;
+
+            // Load a clean copy of tempBytes for fallback page copying
+            const fallbackDoc = await PDFDocument.load(tempBytes.slice(0));
+
+            for (let i = 1; i <= numPages; i++) {
+                const { width: ptW, height: ptH } = pageSizes[i - 1] || { width: 595, height: 842 };
+                let usedCanvas = false;
+
+                try {
+                    const jsPage = await pdfJsDoc.getPage(i);
+
+                    // Cap canvas dimensions to 4096px to stay within browser limits
+                    const rawScale  = dpi / POINTS_PER_INCH;
+                    const rawW      = ptW * rawScale;
+                    const rawH      = ptH * rawScale;
+                    const maxDim    = 4096;
+                    const safeScale = rawW > maxDim || rawH > maxDim
+                        ? rawScale * (maxDim / Math.max(rawW, rawH))
+                        : rawScale;
+
+                    const viewport   = jsPage.getViewport({ scale: safeScale });
+                    canvas.width     = Math.max(1, Math.round(viewport.width));
+                    canvas.height    = Math.max(1, Math.round(viewport.height));
+                    ctx.fillStyle    = '#ffffff';
+                    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+                    await jsPage.render({ canvasContext: ctx, viewport }).promise;
+
+                    const dataUrl = canvas.toDataURL('image/jpeg', quality);
+                    const b64     = dataUrl.split(',')[1];
+                    if (!b64 || b64.length < 50) throw new Error('Canvas produced no image data');
+
+                    const jpegBytes = base64ToBytes(b64);
+                    if (jpegBytes.length < 200) throw new Error('JPEG suspiciously small — likely blank');
+
+                    const img     = await newPdf.embedJpg(jpegBytes);
+                    const newPage = newPdf.addPage([ptW, ptH]);
+                    newPage.drawImage(img, { x: 0, y: 0, width: ptW, height: ptH });
+                    usedCanvas = true;
+                    rendered++;
+                } catch(e) {
+                    console.warn(`Page ${i} canvas render failed, copying original:`, e.message);
+                }
+
+                if (!usedCanvas) {
+                    // Fall back: copy the original page from the pdf-lib version
+                    try {
+                        const [copied] = await newPdf.copyPages(fallbackDoc, [i - 1]);
+                        newPdf.addPage(copied);
+                    } catch(e2) {
+                        newPdf.addPage([ptW, ptH]); // blank page as last resort
+                    }
+                }
+            }
+
+            // If nothing rendered at all, return the safe pdf-lib output
+            if (rendered === 0) {
+                console.warn('All pages failed canvas render — returning pdf-lib output');
+                return tempBytes;
+            }
+
+            const canvasBytes = await newPdf.save({ useObjectStreams: true });
+
+            // Never return a larger file than we started with
+            if (canvasBytes.byteLength > tempBytes.byteLength) {
+                console.log(`Canvas output (${canvasBytes.byteLength}B) > input (${tempBytes.byteLength}B) — keeping smaller pdf-lib result`);
+                return tempBytes;
+            }
+
+            return canvasBytes;
+        }
+
+        async function analyzeCompression() {
+            if (state.files.length === 0) return;
+            const { PDFDocument } = PDFLib;
+            let changed = false;
+            for (const fileData of state.files) {
+                if (state.compressionEstimates[fileData.id] !== undefined) continue;
+                try {
+                    const pdfDoc = await PDFDocument.load(fileData.arrayBuffer.slice(0));
+                    pdfDoc.setTitle(''); pdfDoc.setAuthor(''); pdfDoc.setSubject(''); pdfDoc.setKeywords([]);
+                    // Use pdf-lib only for fast estimate (no canvas rendering)
+                    const compressed = await pdfDoc.save({ useObjectStreams: true });
+                    state.compressionEstimates[fileData.id] = {
+                        originalSize: fileData.size,
+                        compressedSize: compressed.byteLength,
+                    };
+                    changed = true;
+                } catch(e) {
+                    state.compressionEstimates[fileData.id] = null;
+                    changed = true;
+                    console.warn('Compression analysis failed:', fileData.name, e);
+                }
+            }
+            if (changed) render();
+        }
+
+        function parseRanges(rangesStr, pageCount) {
+            const groups = [];
+            const parts = rangesStr.split(',').map(s => s.trim()).filter(Boolean);
+            for (const part of parts) {
+                const dashIdx = part.indexOf('-');
+                if (dashIdx > 0) {
+                    const start = parseInt(part.slice(0, dashIdx).trim(), 10);
+                    const end = parseInt(part.slice(dashIdx + 1).trim(), 10);
+                    if (!isNaN(start) && !isNaN(end) && start >= 1 && end <= pageCount && start <= end) {
+                        groups.push([start, end]);
+                    }
+                } else {
+                    const page = parseInt(part, 10);
+                    if (!isNaN(page) && page >= 1 && page <= pageCount) {
+                        groups.push([page, page]);
+                    }
+                }
+            }
+            return groups;
+        }
+
+        async function handleSplit() {
+            const fileData = state.files.find(f => f.id === state.split.fileId) || state.files[0];
+            if (!fileData) return;
+
+            state.isProcessing = true;
+            render();
+
+            try {
+                const { PDFDocument } = PDFLib;
+                const sourcePdf = await PDFDocument.load(fileData.arrayBuffer.slice(0));
+                const totalPages = sourcePdf.getPageCount();
+
+                let groups;
+                if (state.split.mode === 'every') {
+                    groups = Array.from({ length: totalPages }, (_, i) => [i + 1, i + 1]);
+                } else {
+                    groups = parseRanges(state.split.ranges, totalPages);
+                }
+
+                if (groups.length === 0) {
+                    alert('No valid page ranges specified.');
+                    state.isProcessing = false;
+                    render();
+                    return;
+                }
+
+                const zip = new JSZip();
+                const baseName = fileData.name.replace(/\.pdf$/i, '');
+
+                for (let i = 0; i < groups.length; i++) {
+                    const [startPage, endPage] = groups[i];
+                    const newPdf = await PDFDocument.create();
+                    const pageIndices = [];
+                    for (let p = startPage - 1; p <= endPage - 1; p++) pageIndices.push(p);
+                    const copiedPages = await newPdf.copyPages(sourcePdf, pageIndices);
+                    copiedPages.forEach(page => newPdf.addPage(page));
+                    const pdfBytes = await newPdf.save();
+                    const fileName = state.split.mode === 'every'
+                        ? `${baseName}_page_${startPage}.pdf`
+                        : `${baseName}_part_${i + 1}_pages_${startPage}-${endPage}.pdf`;
+                    zip.file(fileName, pdfBytes);
+                }
+
+                const zipBlob = await zip.generateAsync({ type: 'blob' });
+                const url = URL.createObjectURL(zipBlob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = `${baseName}_split.zip`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(url);
+
+            } catch (err) {
+                console.error('Error splitting PDF:', err);
+                alert(`Error splitting PDF: ${err.message}`);
+            }
+
+            state.isProcessing = false;
+            render();
+        }
+
         // --- RENDER ---
+        const renderMergePanel = () => {
+            const totalPages = state.files.reduce((s, f) => s + f.pageCount, 0);
+            const totalSize  = state.files.reduce((s, f) => s + f.size, 0);
+
+            const dropZoneId = 'mergeDropZone';
+            return `
+            <div class="max-w-2xl mx-auto space-y-6">
+
+                <!-- Upload zone -->
+                <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                    <div class="px-6 pt-5 pb-3 border-b border-slate-100 flex items-center gap-2">
+                        <span class="w-5 h-5 text-emerald-600">${icons.merge}</span>
+                        <h2 class="font-semibold text-slate-800">Add PDFs to merge</h2>
+                    </div>
+                    <div class="p-6">
+                        <label id="${dropZoneId}" for="mergeFileInput"
+                            class="block border-2 border-dashed border-slate-300 rounded-xl p-8 text-center cursor-pointer hover:border-emerald-400 hover:bg-emerald-50 transition-colors">
+                            <div class="w-10 h-10 mx-auto mb-3 text-slate-400 pointer-events-none">${icons.upload}</div>
+                            <p class="text-slate-600 font-medium pointer-events-none">Drag &amp; drop PDFs here</p>
+                            <p class="text-slate-400 text-sm mt-1 pointer-events-none">or click to browse — multiple files allowed</p>
+                            <input type="file" id="mergeFileInput" class="hidden" accept=".pdf" multiple
+                                onchange="handleFilesAdded(this.files); this.value=''">
+                        </label>
+                    </div>
+                </div>
+
+                <!-- File list -->
+                ${state.files.length === 0 ? `
+                <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center">
+                    <div class="w-14 h-14 mx-auto mb-4 text-slate-200">${icons.fileText}</div>
+                    <p class="text-slate-400 text-sm">No files added yet — upload PDFs above to begin</p>
+                </div>
+                ` : `
+                <div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                    <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between">
+                        <div>
+                            <h2 class="font-semibold text-slate-800">Files to merge
+                                <span class="ml-1.5 text-xs font-medium bg-emerald-100 text-emerald-700 px-2 py-0.5 rounded-full">${state.files.length}</span>
+                            </h2>
+                            <p class="text-xs text-slate-400 mt-0.5">${totalPages} total pages &middot; ${formatFileSize(totalSize)}</p>
+                        </div>
+                        <button onclick="clearAll()"
+                            class="text-xs text-red-500 hover:text-red-700 hover:bg-red-50 px-2 py-1 rounded transition-colors flex items-center gap-1">
+                            <span class="w-3.5 h-3.5">${icons.trash}</span> Clear all
+                        </button>
+                    </div>
+
+                    <div class="divide-y divide-slate-100">
+                        ${state.files.map((f, idx) => `
+                        <div class="flex items-center gap-3 px-5 py-3 hover:bg-slate-50 transition-colors">
+                            <span class="text-xs font-mono text-slate-300 w-4 text-right shrink-0">${idx + 1}</span>
+                            <div class="w-7 h-7 text-blue-400 shrink-0">${icons.fileText}</div>
+                            <div class="flex-1 min-w-0">
+                                <p class="text-sm font-medium text-slate-800 truncate" title="${f.name}">${f.name}</p>
+                                <p class="text-xs text-slate-400">${f.pageCount} page${f.pageCount !== 1 ? 's' : ''} &middot; ${formatFileSize(f.size)}</p>
+                            </div>
+                            <div class="flex items-center gap-0.5 shrink-0">
+                                <button onclick="moveFile('${f.id}', -1)"
+                                    ${idx === 0 ? 'disabled' : ''}
+                                    title="Move up"
+                                    class="p-1.5 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200 disabled:opacity-25 disabled:cursor-not-allowed transition-colors">
+                                    ${icons.chevronUp}
+                                </button>
+                                <button onclick="moveFile('${f.id}', 1)"
+                                    ${idx === state.files.length - 1 ? 'disabled' : ''}
+                                    title="Move down"
+                                    class="p-1.5 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-200 disabled:opacity-25 disabled:cursor-not-allowed transition-colors">
+                                    ${icons.chevronDown}
+                                </button>
+                                <button onclick="removeFile('${f.id}')"
+                                    title="Remove"
+                                    class="p-1.5 ml-1 rounded text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors">
+                                    <span class="w-3.5 h-3.5">${icons.x}</span>
+                                </button>
+                            </div>
+                        </div>
+                        `).join('')}
+                    </div>
+
+                    <div class="px-6 py-4 bg-slate-50 border-t border-slate-100 flex items-center justify-between gap-4">
+                        <p class="text-xs text-slate-500">Files will be merged in the order listed above.</p>
+                        <button onclick="handleMergeDownload()"
+                            ${state.isProcessing ? 'disabled' : ''}
+                            class="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-400 text-white text-sm font-semibold px-5 py-2.5 rounded-lg transition-colors shrink-0">
+                            ${state.isProcessing
+                                ? `<div class="spinner shrink-0" style="width:16px;height:16px;border-top-color:white;border-color:rgba(255,255,255,0.35)"></div> Merging…`
+                                : `<span class="w-4 h-4 shrink-0">${icons.download}</span> Merge &amp; Download`}
+                        </button>
+                    </div>
+                </div>
+                `}
+            </div>
+            `;
+        };
+
+        const renderTabs = () => `
+            <div class="bg-white border-b border-slate-200">
+                <div class="max-w-7xl mx-auto px-4">
+                    <div class="flex">
+                        <button onclick="setTab('redact')" class="px-5 py-3 text-sm font-medium border-b-2 transition-colors ${state.activeTab === 'redact' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-600 hover:text-slate-800 hover:border-slate-300'}">
+                            Redact &amp; Merge
+                        </button>
+                        <button onclick="setTab('split')" class="px-5 py-3 text-sm font-medium border-b-2 transition-colors ${state.activeTab === 'split' ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-600 hover:text-slate-800 hover:border-slate-300'}">
+                            Split PDF
+                        </button>
+                        <button onclick="setTab('merge')" class="px-5 py-3 text-sm font-medium border-b-2 transition-colors ${state.activeTab === 'merge' ? 'border-emerald-600 text-emerald-600' : 'border-transparent text-slate-600 hover:text-slate-800 hover:border-slate-300'}">
+                            Merge PDFs
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        const renderSplitPanel = () => {
+            const selectedFile = state.files.find(f => f.id === state.split.fileId) || state.files[0];
+            const totalPages = selectedFile ? selectedFile.pageCount : 0;
+            let outputCount = 0;
+            if (selectedFile) {
+                outputCount = state.split.mode === 'every'
+                    ? totalPages
+                    : parseRanges(state.split.ranges, totalPages).length;
+            }
+
+            return `
+                <div class="max-w-2xl mx-auto space-y-6">
+
+                    <div class="rounded-xl border bg-white text-card-foreground shadow">
+                        <div class="flex flex-col space-y-1.5 p-6">
+                            <h3 class="font-semibold leading-none tracking-tight flex items-center gap-2">
+                                <span class="w-5 h-5 text-blue-600">${icons.fileText}</span>
+                                Select File to Split
+                            </h3>
+                        </div>
+                        <div class="p-6 pt-0">
+                            ${state.files.length === 0 ? `
+                                <div id="splitDropZone" class="rounded-xl border-2 border-dashed border-slate-300 p-8 text-center hover:border-blue-400 hover:bg-blue-50/50 transition-colors cursor-pointer">
+                                    <div class="w-12 h-12 mx-auto mb-4 text-slate-400 pointer-events-none">${icons.upload}</div>
+                                    <p class="text-slate-600 font-medium pointer-events-none">Drag &amp; drop a PDF here</p>
+                                    <p class="text-slate-400 text-sm mt-1 pointer-events-none">or click to browse</p>
+                                    <input type="file" id="splitFileInput" class="hidden" accept=".pdf" multiple onchange="handleFilesAdded(this.files); this.value=''">
+                                </div>
+                            ` : `
+                                <div class="space-y-2">
+                                    ${state.files.map(file => `
+                                        <label class="flex items-center gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${(state.split.fileId || state.files[0].id) === file.id ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}">
+                                            <input type="radio" name="split-file" value="${file.id}" ${(state.split.fileId || state.files[0].id) === file.id ? 'checked' : ''} onchange="setSplitFile('${file.id}')" class="text-blue-600 flex-shrink-0">
+                                            <div class="w-6 h-6 text-blue-500 flex-shrink-0">${icons.fileText}</div>
+                                            <div>
+                                                <p class="font-medium text-slate-800 text-sm">${file.name}</p>
+                                                <p class="text-xs text-slate-500">${file.pageCount} page${file.pageCount !== 1 ? 's' : ''} &bull; ${formatFileSize(file.size)}</p>
+                                            </div>
+                                        </label>
+                                    `).join('')}
+                                </div>
+                            `}
+                        </div>
+                    </div>
+
+                    ${selectedFile ? `
+                        <div class="rounded-xl border bg-white text-card-foreground shadow">
+                            <div class="flex flex-col space-y-1.5 p-6">
+                                <h3 class="font-semibold leading-none tracking-tight">Split Mode</h3>
+                                <p class="text-sm text-muted-foreground">Choose how to divide the document</p>
+                            </div>
+                            <div class="p-6 pt-0 space-y-3">
+                                <label class="flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${state.split.mode === 'every' ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}">
+                                    <input type="radio" name="split-mode" value="every" ${state.split.mode === 'every' ? 'checked' : ''} onchange="setSplitMode('every')" class="mt-0.5 text-blue-600">
+                                    <div>
+                                        <p class="font-medium text-slate-800 text-sm">Split into individual pages</p>
+                                        <p class="text-xs text-slate-500">Each page becomes a separate PDF &mdash; ${totalPages} file${totalPages !== 1 ? 's' : ''}</p>
+                                    </div>
+                                </label>
+                                <label class="flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${state.split.mode === 'ranges' ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'}">
+                                    <input type="radio" name="split-mode" value="ranges" ${state.split.mode === 'ranges' ? 'checked' : ''} onchange="setSplitMode('ranges')" class="mt-0.5 text-blue-600">
+                                    <div class="flex-1">
+                                        <p class="font-medium text-slate-800 text-sm">Split by custom ranges</p>
+                                        <p class="text-xs text-slate-500 mb-2">Define which pages go into each output file</p>
+                                        ${state.split.mode === 'ranges' ? `
+                                            <input
+                                                id="split-ranges-input"
+                                                type="text"
+                                                value="${state.split.ranges}"
+                                                oninput="setSplitRanges(this.value)"
+                                                placeholder="e.g., 1-3, 4-6, 7"
+                                                class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none"
+                                            >
+                                            <p class="text-xs text-slate-400 mt-1">Pages 1&ndash;${totalPages}. Separate ranges with commas. Each entry becomes one PDF.</p>
+                                        ` : ''}
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="rounded-xl border bg-white text-card-foreground shadow">
+                            <div class="flex flex-col space-y-1.5 p-6">
+                                <h3 class="font-semibold leading-none tracking-tight">Output</h3>
+                            </div>
+                            <div class="p-6 pt-0">
+                                <div class="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-4">
+                                    <div class="grid grid-cols-3 gap-4 text-center">
+                                        <div>
+                                            <p class="text-2xl font-bold text-blue-700">${totalPages}</p>
+                                            <p class="text-xs text-blue-600">Source Pages</p>
+                                        </div>
+                                        <div>
+                                            <p class="text-2xl font-bold text-blue-700">${outputCount}</p>
+                                            <p class="text-xs text-blue-600">Output Files</p>
+                                        </div>
+                                        <div>
+                                            <p class="text-2xl font-bold text-blue-700">ZIP</p>
+                                            <p class="text-xs text-blue-600">Download As</p>
+                                        </div>
+                                    </div>
+                                </div>
+                                ${state.split.mode === 'ranges' && state.split.ranges && outputCount === 0 ? `
+                                    <div class="bg-red-50 border border-red-200 rounded-lg p-3 text-xs text-red-700 mb-4">
+                                        No valid ranges found. Use format like "1-3, 4, 6-8" with pages 1&ndash;${totalPages}.
+                                    </div>
+                                ` : ''}
+                                <button onclick="handleSplit()" ${state.isProcessing || outputCount === 0 ? 'disabled' : ''}
+                                    class="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-semibold h-11 rounded-lg px-8 flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed transition-all">
+                                    ${state.isProcessing
+                                        ? `<div class="spinner mr-2" style="border-top-color: white; border-color: rgba(255,255,255,0.3)"></div> Processing...`
+                                        : `<span class="w-5 h-5 mr-2">${icons.download}</span> Download Split PDFs (ZIP)`}
+                                </button>
+                            </div>
+                        </div>
+                    ` : ''}
+
+                </div>
+            `;
+        };
+
         const renderHeader = () => `
             <header class="bg-white border-b border-slate-200 sticky top-0 z-10">
                 <div class="max-w-7xl mx-auto px-4 py-4">
@@ -641,7 +1199,97 @@
             </div>
         `;
 
-        const renderOptions = () => `
+        const renderOptions = () => {
+            const levelNames = ['Off', 'Low', 'Medium', 'High', 'Maximum'];
+            const levelDesc = [
+                'No compression — original file structure preserved',
+                'Object stream compression — structure-level savings (~5–15%)',
+                'Object streams + flatten form fields (~10–25%)',
+                'Re-render pages as JPEG at 120 DPI — good readability, major savings for image PDFs',
+                'Re-render pages as JPEG at 72 DPI, quality 32% — extreme compression, text still legible',
+            ];
+            const lvl = state.options.compressionLevel;
+            const lvlColor = lvl === 0 ? 'bg-slate-200 text-slate-600'
+                           : lvl <= 2  ? 'bg-blue-100 text-blue-700'
+                                       : 'bg-purple-100 text-purple-700';
+
+            // Build per-file compression estimate rows
+            const analyzedFiles = state.files.filter(f => state.compressionEstimates[f.id] != null);
+            let estimateHTML = '';
+            if (lvl >= 3) {
+                // Canvas re-render mode — we can't pre-estimate accurately; show info box
+                const dpiLabel = lvl >= 4 ? '96 DPI, JPEG 48%' : '150 DPI, JPEG 72%';
+                let baselineRows = '';
+                if (analyzedFiles.length > 0) {
+                    baselineRows = analyzedFiles.map(f => {
+                        const e = state.compressionEstimates[f.id];
+                        const savings = e.originalSize - e.compressedSize;
+                        const pct = Math.round((savings / e.originalSize) * 100);
+                        const str = savings >= 1024*1024
+                            ? (savings/(1024*1024)).toFixed(2) + ' MB'
+                            : Math.round(savings/1024) + ' KB';
+                        return pct > 0
+                            ? `<div class="flex justify-between text-xs text-slate-500 mt-0.5"><span class="truncate max-w-[120px]">${f.name}</span><span>structure saves ${str} (${pct}%)</span></div>`
+                            : '';
+                    }).join('');
+                }
+                estimateHTML = `
+                    <div class="mt-2.5 p-2.5 bg-amber-50 border border-amber-200 rounded-lg">
+                        <p class="text-xs font-semibold text-amber-800 mb-1">⚠ Canvas re-render mode (${dpiLabel})</p>
+                        <p class="text-xs text-amber-700">Pages are converted to JPEG images — text will not be selectable/searchable after download. Best for scanned PDFs.</p>
+                        <p class="text-xs font-semibold text-emerald-700 mt-1.5">Typical savings: 40–80% for image PDFs · 15–40% for text PDFs</p>
+                        ${baselineRows ? `<div class="border-t border-amber-200 mt-1.5 pt-1">${baselineRows}</div>` : ''}
+                    </div>`;
+            } else if (lvl > 0 && analyzedFiles.length > 0) {
+                let totalOrig = 0, totalComp = 0;
+                const rows = analyzedFiles.map(f => {
+                    const e = state.compressionEstimates[f.id];
+                    totalOrig += e.originalSize;
+                    totalComp += e.compressedSize;
+                    const savings = e.originalSize - e.compressedSize;
+                    const pct = Math.round((savings / e.originalSize) * 100);
+                    if (pct <= 0) return `<div class="text-xs text-slate-400 py-0.5">${f.name}: already well-compressed</div>`;
+                    const savingsStr = savings >= 1024*1024
+                        ? (savings/(1024*1024)).toFixed(2) + ' MB'
+                        : Math.round(savings/1024) + ' KB';
+                    return `
+                        <div class="flex items-center gap-1.5 text-xs py-0.5">
+                            <span class="text-slate-500 truncate max-w-[90px]" title="${f.name}">${f.name}</span>
+                            <span class="text-slate-400 shrink-0">${formatFileSize(e.originalSize)}</span>
+                            <span class="text-blue-400 shrink-0">→</span>
+                            <span class="font-medium text-slate-700 shrink-0">~${formatFileSize(e.compressedSize)}</span>
+                            <span class="text-emerald-600 font-semibold ml-auto shrink-0">saves ${savingsStr} (${pct}%)</span>
+                        </div>`;
+                }).join('');
+                const totalSavings = totalOrig - totalComp;
+                const totalPct = totalOrig > 0 ? Math.round((totalSavings/totalOrig)*100) : 0;
+                const totalSavingsStr = totalSavings >= 1024*1024
+                    ? (totalSavings/(1024*1024)).toFixed(2) + ' MB'
+                    : Math.round(totalSavings/1024) + ' KB';
+                estimateHTML = `
+                    <div class="mt-2.5 p-2.5 bg-white border border-slate-200 rounded-lg">
+                        <p class="text-xs font-semibold text-slate-600 mb-1.5">Savings estimate (structure compression):</p>
+                        ${rows}
+                        ${analyzedFiles.length > 1 && totalSavings > 0 ? `
+                        <div class="border-t border-slate-100 mt-1.5 pt-1.5 flex items-center justify-between text-xs font-semibold">
+                            <span class="text-slate-600">Combined total</span>
+                            <span class="text-emerald-600">Save up to ${totalSavingsStr} (${totalPct}%)</span>
+                        </div>` : ''}
+                    </div>`;
+            } else if (lvl > 0 && state.files.length > 0 && analyzedFiles.length === 0) {
+                estimateHTML = `<p class="text-xs text-blue-500 mt-2 italic">Analyzing files…</p>`;
+            }
+
+            return `
+            <div class="flex items-center justify-between p-3 rounded-lg border-2 ${state.options.applyRedaction ? 'bg-red-50 border-red-200' : 'bg-slate-50 border-slate-200'}">
+                <div>
+                    <p class="font-medium text-slate-800 text-sm">Apply Redactions</p>
+                    <p class="text-xs text-slate-500">${state.options.applyRedaction ? 'Pages re-rendered as images — text data permanently destroyed' : 'PDF will be processed without any redactions'}</p>
+                </div>
+                <button onclick="toggleOption('applyRedaction')" class="w-10 h-6 ${state.options.applyRedaction ? 'bg-red-500' : 'bg-slate-300'} rounded-full relative cursor-pointer transition-colors">
+                    <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${state.options.applyRedaction ? 'right-1' : 'left-1'}"></div>
+                </button>
+            </div>
             <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
                 <div>
                     <p class="font-medium text-slate-800 text-sm">Remove Metadata</p>
@@ -651,14 +1299,19 @@
                     <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${state.options.removeMetadata ? 'right-1' : 'left-1'}"></div>
                 </button>
             </div>
-            <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
-                <div>
+            <div class="p-3 bg-slate-50 rounded-lg">
+                <div class="flex items-center justify-between mb-2">
                     <p class="font-medium text-slate-800 text-sm">Compress Output</p>
-                    <p class="text-xs text-slate-500">Reduce file size after redaction</p>
+                    <span class="text-xs font-semibold px-2 py-0.5 rounded-full ${lvlColor}">${levelNames[lvl]}</span>
                 </div>
-                <button onclick="toggleOption('compress')" class="w-10 h-6 ${state.options.compress ? 'bg-emerald-500' : 'bg-slate-300'} rounded-full relative cursor-pointer transition-colors">
-                    <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${state.options.compress ? 'right-1' : 'left-1'}"></div>
-                </button>
+                <input type="range" min="0" max="4" value="${lvl}"
+                    oninput="setCompressionLevel(parseInt(this.value))"
+                    class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-blue-600 mb-1">
+                <div class="flex justify-between text-xs text-slate-400 mb-2 px-0.5">
+                    <span>Off</span><span>Low</span><span>Med</span><span>High</span><span>Max</span>
+                </div>
+                <p class="text-xs text-slate-500 italic">${levelDesc[lvl]}</p>
+                ${estimateHTML}
             </div>
             <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
                 <div>
@@ -669,7 +1322,8 @@
                     <div class="absolute top-1 w-4 h-4 bg-white rounded-full transition-all ${state.options.mergeAll ? 'right-1' : 'left-1'}"></div>
                 </button>
             </div>
-        `;
+            `;
+        };
 
         const renderRules = () => `
             <div class="space-y-2">
@@ -796,6 +1450,7 @@
                     <ul class="list-disc list-inside space-y-1">
                         <li>${state.matches.length} sensitive item${state.matches.length !== 1 ? 's' : ''} will be redacted with black rectangles</li>
                         ${state.options.removeMetadata ? '<li>Document metadata will be stripped</li>' : ''}
+                        ${state.options.compressionLevel > 0 ? `<li>Compression: ${'Off,Low,Medium,High,Maximum'.split(',')[state.options.compressionLevel]} level applied</li>` : ''}
                         ${state.options.mergeAll && state.files.length > 1 ? `<li>${state.files.length} files will be merged into one</li>` : ''}
                     </ul>
                 </div>
@@ -807,67 +1462,72 @@
             `;
         };
 
+        const renderRedactView = () => `
+            <div class="grid lg:grid-cols-3 gap-6">
+                <div class="lg:col-span-2 space-y-6">
+                    <div class="rounded-xl border bg-white text-card-foreground shadow">
+                        <div class="flex flex-col space-y-1.5 p-6">
+                            <h3 class="font-semibold leading-none tracking-tight flex items-center gap-2">
+                                <span class="w-5 h-5 text-blue-600">${icons.fileText}</span>
+                                Upload PDFs
+                            </h3>
+                            <p class="text-sm text-muted-foreground">Drag and drop PDF files to begin redaction</p>
+                        </div>
+                        <div class="p-6 pt-0">${renderDropZone()}</div>
+                    </div>
+
+                    <div class="rounded-xl border bg-white text-card-foreground shadow">
+                        <div class="flex flex-col space-y-1.5 p-6">
+                            <h3 class="font-semibold leading-none tracking-tight flex items-center gap-2">
+                                <span class="w-5 h-5 text-purple-600">${icons.settings}</span>
+                                Processing Options
+                            </h3>
+                        </div>
+                        <div class="p-6 pt-0 space-y-4">${renderOptions()}</div>
+                    </div>
+                </div>
+
+                <div class="space-y-6">
+                    <div class="rounded-xl border bg-white text-card-foreground shadow">
+                        <div class="flex flex-col space-y-1.5 p-6">
+                            <h3 class="font-semibold leading-none tracking-tight">Redaction Rules</h3>
+                            <p class="text-sm text-muted-foreground">Configure patterns to auto-redact</p>
+                        </div>
+                        <div class="p-6 pt-0">${renderRules()}</div>
+                    </div>
+
+                    <div class="rounded-xl border bg-white text-card-foreground shadow">
+                        <div class="flex flex-col space-y-1.5 p-6">
+                            <h3 class="font-semibold leading-none tracking-tight">Scan Results</h3>
+                            <p class="text-sm text-muted-foreground">Detected sensitive data</p>
+                        </div>
+                        <div class="p-6 pt-0">${renderReport()}</div>
+                    </div>
+
+                    <div class="rounded-xl border bg-white text-card-foreground shadow">
+                        <div class="flex flex-col space-y-1.5 p-6">
+                            <div class="flex items-center justify-between">
+                                <h3 class="font-semibold leading-none tracking-tight">Preview &amp; Export</h3>
+                                ${state.files.length > 0 ? `
+                                    <button onclick="clearAll()" class="text-xs text-red-600 hover:text-red-700 flex items-center gap-1">
+                                        <span class="w-4 h-4">${icons.trash}</span> Clear All
+                                    </button>
+                                ` : ''}
+                            </div>
+                        </div>
+                        <div class="p-6 pt-0">${renderPreview()}</div>
+                    </div>
+                </div>
+            </div>
+        `;
+
         function render() {
             const app = document.getElementById('app');
             app.innerHTML = `
                 ${renderHeader()}
+                ${renderTabs()}
                 <main class="max-w-7xl mx-auto px-4 py-8 flex-grow">
-                    <div class="grid lg:grid-cols-3 gap-6">
-                        <div class="lg:col-span-2 space-y-6">
-                            <div class="rounded-xl border bg-white text-card-foreground shadow">
-                                <div class="flex flex-col space-y-1.5 p-6">
-                                    <h3 class="font-semibold leading-none tracking-tight flex items-center gap-2">
-                                        <span class="w-5 h-5 text-blue-600">${icons.fileText}</span>
-                                        Upload PDFs
-                                    </h3>
-                                    <p class="text-sm text-muted-foreground">Drag and drop PDF files to begin redaction</p>
-                                </div>
-                                <div class="p-6 pt-0">${renderDropZone()}</div>
-                            </div>
-
-                            <div class="rounded-xl border bg-white text-card-foreground shadow">
-                                <div class="flex flex-col space-y-1.5 p-6">
-                                    <h3 class="font-semibold leading-none tracking-tight flex items-center gap-2">
-                                        <span class="w-5 h-5 text-purple-600">${icons.settings}</span>
-                                        Processing Options
-                                    </h3>
-                                </div>
-                                <div class="p-6 pt-0 space-y-4">${renderOptions()}</div>
-                            </div>
-                        </div>
-
-                        <div class="space-y-6">
-                            <div class="rounded-xl border bg-white text-card-foreground shadow">
-                                <div class="flex flex-col space-y-1.5 p-6">
-                                    <h3 class="font-semibold leading-none tracking-tight">Redaction Rules</h3>
-                                    <p class="text-sm text-muted-foreground">Configure patterns to auto-redact</p>
-                                </div>
-                                <div class="p-6 pt-0">${renderRules()}</div>
-                            </div>
-
-                            <div class="rounded-xl border bg-white text-card-foreground shadow">
-                                <div class="flex flex-col space-y-1.5 p-6">
-                                    <h3 class="font-semibold leading-none tracking-tight">Scan Results</h3>
-                                    <p class="text-sm text-muted-foreground">Detected sensitive data</p>
-                                </div>
-                                <div class="p-6 pt-0">${renderReport()}</div>
-                            </div>
-
-                            <div class="rounded-xl border bg-white text-card-foreground shadow">
-                                <div class="flex flex-col space-y-1.5 p-6">
-                                    <div class="flex items-center justify-between">
-                                        <h3 class="font-semibold leading-none tracking-tight">Preview & Export</h3>
-                                        ${state.files.length > 0 ? `
-                                            <button onclick="clearAll()" class="text-xs text-red-600 hover:text-red-700 flex items-center gap-1">
-                                                <span class="w-4 h-4">${icons.trash}</span> Clear All
-                                            </button>
-                                        ` : ''}
-                                    </div>
-                                </div>
-                                <div class="p-6 pt-0">${renderPreview()}</div>
-                            </div>
-                        </div>
-                    </div>
+                    ${state.activeTab === 'split' ? renderSplitPanel() : state.activeTab === 'merge' ? renderMergePanel() : renderRedactView()}
                 </main>
                 <footer class="bg-white border-t border-slate-200 mt-12">
                     <div class="max-w-7xl mx-auto px-4 py-6 text-center text-sm text-slate-500">
@@ -884,32 +1544,49 @@
         document.addEventListener('dragover', (e) => {
             e.preventDefault();
             e.dataTransfer.dropEffect = 'copy';
-            const dropZone = document.getElementById('dropZone');
-            if (dropZone && (e.target === dropZone || dropZone.contains(e.target))) {
-                dropZone.classList.add('border-blue-500', 'bg-blue-50');
-            }
+            const dropZone      = document.getElementById('dropZone');
+            const splitDropZone = document.getElementById('splitDropZone');
+            const mergeDropZone = document.getElementById('mergeDropZone');
+            if (dropZone      && (e.target === dropZone      || dropZone.contains(e.target)))      dropZone.classList.add('border-blue-500', 'bg-blue-50');
+            if (splitDropZone && (e.target === splitDropZone || splitDropZone.contains(e.target))) splitDropZone.classList.add('border-blue-500', 'bg-blue-50');
+            if (mergeDropZone && (e.target === mergeDropZone || mergeDropZone.contains(e.target))) mergeDropZone.classList.add('border-emerald-400', 'bg-emerald-50');
         });
         document.addEventListener('dragleave', (e) => {
-            const dropZone = document.getElementById('dropZone');
-            if (dropZone && !dropZone.contains(e.relatedTarget)) {
-                dropZone.classList.remove('border-blue-500', 'bg-blue-50');
-            }
+            const dropZone      = document.getElementById('dropZone');
+            const splitDropZone = document.getElementById('splitDropZone');
+            const mergeDropZone = document.getElementById('mergeDropZone');
+            if (dropZone      && !dropZone.contains(e.relatedTarget))      dropZone.classList.remove('border-blue-500', 'bg-blue-50');
+            if (splitDropZone && !splitDropZone.contains(e.relatedTarget)) splitDropZone.classList.remove('border-blue-500', 'bg-blue-50');
+            if (mergeDropZone && !mergeDropZone.contains(e.relatedTarget)) mergeDropZone.classList.remove('border-emerald-400', 'bg-emerald-50');
         });
         document.addEventListener('drop', (e) => {
             e.preventDefault();
-            const dropZone = document.getElementById('dropZone');
+            const dropZone      = document.getElementById('dropZone');
+            const splitDropZone = document.getElementById('splitDropZone');
+            const mergeDropZone = document.getElementById('mergeDropZone');
             if (dropZone) {
                 dropZone.classList.remove('border-blue-500', 'bg-blue-50');
-                if (e.target === dropZone || dropZone.contains(e.target)) {
-                    handleFilesAdded(e.dataTransfer.files);
-                }
+                if (e.target === dropZone || dropZone.contains(e.target)) handleFilesAdded(e.dataTransfer.files);
+            }
+            if (splitDropZone) {
+                splitDropZone.classList.remove('border-blue-500', 'bg-blue-50');
+                if (e.target === splitDropZone || splitDropZone.contains(e.target)) handleFilesAdded(e.dataTransfer.files);
+            }
+            if (mergeDropZone) {
+                mergeDropZone.classList.remove('border-emerald-400', 'bg-emerald-50');
+                if (e.target === mergeDropZone || mergeDropZone.contains(e.target)) handleFilesAdded(e.dataTransfer.files);
             }
         });
         document.addEventListener('click', (e) => {
             const dropZone = document.getElementById('dropZone');
+            const splitDropZone = document.getElementById('splitDropZone');
             if (dropZone && (e.target === dropZone || dropZone.contains(e.target))) {
                 const fileInput = document.getElementById('fileInput');
                 if (e.target !== fileInput) fileInput.click();
+            }
+            if (splitDropZone && (e.target === splitDropZone || splitDropZone.contains(e.target))) {
+                const splitFileInput = document.getElementById('splitFileInput');
+                if (e.target !== splitFileInput) splitFileInput.click();
             }
         });
     </script>
