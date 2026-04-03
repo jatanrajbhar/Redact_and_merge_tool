@@ -1,5 +1,7 @@
 # PDF Redact and Merge Tool
 
+**Live at: [redact-and-merge-tool.vercel.app](https://redact-and-merge-tool.vercel.app/)**
+
 A powerful, browser-based tool for redacting sensitive information from PDF documents and merging multiple PDFs. Runs entirely client-side with no server uploads or data transmission.
 
 ## Features
